@@ -31,10 +31,10 @@ def main(args):
     # load dataset
     kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
  
-    dset = TrainSet(folder=args.data_path)
+    dset = TrainSet(folder=args.data_path, fs=args.fs, nperseg=args.nperseg)
     train_loader = torch.utils.data.DataLoader(dset, batch_size=args.batch_size, shuffle=True, **kwargs)
  
-    dtset = TestSet(folder=args.data_path)
+    dtset = TestSet(folder=args.data_path, fs=args.fs, nperseg=args.nperseg)
     test_loader = torch.utils.data.DataLoader(dtset, batch_size=1, shuffle=False, **kwargs)
     labels = np.load(os.path.join(args.data_path, 'label.npy'))
  
@@ -73,12 +73,18 @@ def main(args):
  
         train(args, model, epoch, train_loader, optimizer)
         auc_result = test(args, model, test_loader, labels)
-        if auc_result > old_auc_result:
+        if auc_result >= old_auc_result:
             old_auc_result = auc_result
             if args.save_model == 1:
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict()}, args.save_path + 'TSRNet-%d.pt' % epoch)
+        
+        # Always save the latest model as fallback
+        if args.save_model == 1:
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict()}, args.save_path + 'TSRNet-latest.pt')
     print("final best auc: ", old_auc_result)
  
  
@@ -93,8 +99,8 @@ def train(args, model, epoch, train_loader, optimizer):
         bs, time_length, dim = time_ecg.shape
         mask_time = copy.deepcopy(time_ecg)
         mask = torch.zeros((bs,time_length,1), dtype=torch.bool).to(device)
-        patch_length = time_length // 100 #48
-        for j in random.sample(range(0,100), args.mask_ratio_time):
+        patch_length = time_length // args.patch_length_div #48
+        for j in random.sample(range(0, args.patch_length_div), args.mask_ratio_time):
             mask[:, j*patch_length:(j+1)*patch_length] = 1 #(32, 48, 1)
         mask_time = torch.mul(mask_time, ~mask)
  
@@ -148,7 +154,7 @@ def test(args, model, test_loader, labels):
                 left = max(0, r_index_value - 240)
                 mask_loss[left:r_index_value+240,:] = 1
  
-        for j in range(100//args.mask_ratio_time):
+        for j in range(args.patch_length_div//args.mask_ratio_time):
             # mask on time branch
             patch_interval_time = 4800 // args.mask_ratio_time
             time_ecg = time_ecg.float().to(device)
@@ -200,7 +206,10 @@ def test(args, model, test_loader, labels):
  
     max_anomaly_score = scores.max()
     min_anomaly_score = scores.min()
-    scores = (scores - min_anomaly_score) / (max_anomaly_score - min_anomaly_score)
+    if max_anomaly_score == min_anomaly_score:
+        scores = np.zeros_like(scores)
+    else:
+        scores = (scores - min_anomaly_score) / (max_anomaly_score - min_anomaly_score)
  
     auc_result = roc_auc_score(test_labels, scores)
  
@@ -230,6 +239,9 @@ if __name__ == '__main__':
     parser.add_argument("--spec", default=False)
     parser.add_argument("--pth_path", type=str, default=None)
     parser.add_argument("--mask_loss", default=False)  #Peak-based Error
+    parser.add_argument("--fs", type=int, default=500, help='Sampling frequency for STFT')
+    parser.add_argument("--nperseg", type=int, default=125, help='Length of each segment for STFT')
+    parser.add_argument("--patch_length_div", type=int, default=100, help='Divisor to calculate patch length for mask')
 
     args = parser.parse_args()
     

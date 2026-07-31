@@ -11,8 +11,10 @@ from utils import normalize, beat_normalize
 from torch.utils.data import Dataset
  
 class TrainSet(Dataset):
-    def __init__(self, folder):
+    def __init__(self, folder, fs=500, nperseg=125):
         self.train_data = np.load(os.path.join(folder, 'train.npy'))
+        self.fs = fs
+        self.nperseg = nperseg
 
     def checkR(self, ecg):
         working_data, measures = hp.process(ecg, 500.0)
@@ -28,7 +30,7 @@ class TrainSet(Dataset):
        
         # Short Time Fast Fourier Transform
         # 500 is the sample rate of PTB-XL, 360 is the sample rate of MIT-BIH
-        f,t, Zxx = stft(time_instance.transpose(1,0),fs=500, window='hann',nperseg=125)
+        f,t, Zxx = stft(time_instance.transpose(1,0),fs=self.fs, window='hann',nperseg=self.nperseg)
         spectrogram_instance = np.abs(Zxx)  #(12, 63, 78)
         spectrogram_instance = spectrogram_instance.transpose(1,2,0)     #(63, 78, 12)
         return time_instance, spectrogram_instance
@@ -36,8 +38,10 @@ class TrainSet(Dataset):
  
  
 class TestSet(Dataset):
-    def __init__(self, folder):
+    def __init__(self, folder, fs=500, nperseg=125):
         self.test_data = np.load(os.path.join(folder, 'test.npy'))
+        self.fs = fs
+        self.nperseg = nperseg
        
     def __len__(self):
         return self.test_data.shape[0]
@@ -52,7 +56,7 @@ class TestSet(Dataset):
         r_index = self.checkR(time_instance[:,1])
         time_instance = time_instance[100:4900,:]
         # Short Time Fast Fourier Transform
-        f,t, Zxx = stft(time_instance.transpose(1,0),fs=500, window='hann',nperseg=125)
+        f,t, Zxx = stft(time_instance.transpose(1,0),fs=self.fs, window='hann',nperseg=self.nperseg)
         spectrogram_instance = np.abs(Zxx)  #(12, 63, 78)
         spectrogram_instance = spectrogram_instance.transpose(1,2,0)     #(63, 78, 12)
         return time_instance, spectrogram_instance, r_index

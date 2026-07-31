@@ -34,7 +34,7 @@ def main(args):
     # load dataset
     kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
 
-    dtset = TestSet(folder=args.data_path)
+    dtset = TestSet(folder=args.data_path, fs=args.fs, nperseg=args.nperseg)
     test_loader = torch.utils.data.DataLoader(dtset, batch_size=1, shuffle=False, **kwargs)
     labels = np.load(os.path.join(args.data_path, 'label.npy'))
 
@@ -68,7 +68,7 @@ def detection_test(args, model, test_loader, labels):
                     left = max(0, r_index_value - 240)
                     mask_loss[left:r_index_value+240,:] = 1
  
-        for j in range(100//args.mask_ratio_time):
+        for j in range(args.patch_length_div//args.mask_ratio_time):
             # mask on time branch
             patch_interval_time = 4800 // args.mask_ratio_time
             time_ecg = time_ecg.float().to(device)
@@ -119,7 +119,10 @@ def detection_test(args, model, test_loader, labels):
  
     max_anomaly_score = scores.max()
     min_anomaly_score = scores.min()
-    scores = (scores - min_anomaly_score) / (max_anomaly_score - min_anomaly_score)
+    if max_anomaly_score == min_anomaly_score:
+        scores = np.zeros_like(scores)
+    else:
+        scores = (scores - min_anomaly_score) / (max_anomaly_score - min_anomaly_score)
  
     auc_result = roc_auc_score(test_labels, scores)
 
@@ -141,6 +144,9 @@ if __name__ == '__main__':
     parser.add_argument("--gpu", type=str, default="1")
     parser.add_argument("--spec", default=False)
     parser.add_argument("--mask_loss", default=False)  #Peak-based Error
+    parser.add_argument("--fs", type=int, default=500, help='Sampling frequency for STFT')
+    parser.add_argument("--nperseg", type=int, default=125, help='Length of each segment for STFT')
+    parser.add_argument("--patch_length_div", type=int, default=100, help='Divisor to calculate patch length for mask')
 
     args = parser.parse_args()
     
