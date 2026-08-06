@@ -2,3 +2,8 @@
 ckpt/
 data/
 __pycache__/
+
+# Testing Dataset
+Testing dataset/
+"Testing dataset/"
+../../Testing dataset/
