@@ -235,7 +235,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for optimizer')
     parser.add_argument('--seed', type=int, default=668, help='manual seed')
-    parser.add_argument("--gpu", type=str, default="2")
+    parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--spec", default=False)
     parser.add_argument("--pth_path", type=str, default=None)
     parser.add_argument("--mask_loss", default=False)  #Peak-based Error
