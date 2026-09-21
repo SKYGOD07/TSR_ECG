@@ -46,20 +46,27 @@ def preprocess_ptbxl(path, sampling_rate=500):
             count += 1
     train_data = np.asarray(train_data)
 
-    test_label, test_data, count = [], [], 0
+    # test_class keeps the raw PTB-XL diagnostic superclass (NORM/MI/STTC/CD/HYP)
+    # alongside the binary label. It is additive: label.npy keeps exactly the same
+    # 0/1 meaning it always had. Without it, anomaly-specific timestep analysis
+    # (Stage 4) would have nothing to condition on -- and classes must never be
+    # invented to fill that gap.
+    test_label, test_data, test_class, count = [], [], [], 0
     for item in y_test:
         try:
             test_label.append(0 if item[0] == 'NORM' else 1)
+            test_class.append(str(item[0]))
             test_data.append(X_test[count])
             count += 1
         except Exception:
             count += 1
     test_label = np.asarray(test_label)
     test_data = np.asarray(test_data)
+    test_class = np.asarray(test_class, dtype=object)
 
     print(f"train_data: {train_data.shape}, test_data: {test_data.shape}, "
           f"test_label: {test_label.shape} (abnormal count: {test_label.sum()})")
-    return train_data, test_data, test_label
+    return train_data, test_data, test_label, test_class
 
 def normalize(X_ori):
     X = copy.deepcopy(X_ori)
@@ -101,9 +108,9 @@ def denoise_train(train_data, out_dir):
     np.save(out_file, kept)
     print(f"Saved {out_file} ({kept.shape})")
 
-def denoise_test(test_data, test_label, out_dir):
+def denoise_test(test_data, test_label, out_dir, test_class=None):
     denoised = hp_preprocess(test_data)
-    data_kept, label_kept = [], []
+    data_kept, label_kept, class_kept = [], [], []
     for i in range(denoised.shape[0]):
         try:
             hp.process(denoised[i, :, 1], 500.0)
@@ -111,12 +118,21 @@ def denoise_test(test_data, test_label, out_dir):
             continue
         data_kept.append(denoised[i])
         label_kept.append(test_label[i])
+        if test_class is not None:
+            class_kept.append(test_class[i])
     data_kept = np.array(data_kept)
     label_kept = np.array(label_kept)
     os.makedirs(out_dir, exist_ok=True)
     np.save(os.path.join(out_dir, 'test.npy'), data_kept)
     np.save(os.path.join(out_dir, 'label.npy'), label_kept)
     print(f"Saved {os.path.join(out_dir, 'test.npy')} ({data_kept.shape}) and label.npy ({label_kept.shape})")
+    if test_class is not None:
+        class_kept = np.array(class_kept, dtype=object)
+        # Same row order and the same kept/dropped rows as test.npy and label.npy.
+        np.save(os.path.join(out_dir, 'test_class.npy'), class_kept, allow_pickle=True)
+        classes, counts = np.unique(class_kept.astype(str), return_counts=True)
+        print(f"Saved {os.path.join(out_dir, 'test_class.npy')} ({class_kept.shape}) "
+              f"-> {dict(zip(classes.tolist(), counts.tolist()))}")
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess raw PTB-XL dataset into TSRNet npy format")
@@ -125,11 +141,11 @@ def main():
     parser.add_argument("--sampling_rate", type=int, default=500, help="Sampling rate (500 or 100)")
     args = parser.parse_args()
 
-    train_data, test_data, test_label = preprocess_ptbxl(args.raw_path, args.sampling_rate)
+    train_data, test_data, test_label, test_class = preprocess_ptbxl(args.raw_path, args.sampling_rate)
     print("Denoising + normalizing train set...")
     denoise_train(train_data, args.out_dir)
     print("Denoising test set...")
-    denoise_test(test_data, test_label, args.out_dir)
+    denoise_test(test_data, test_label, args.out_dir, test_class=test_class)
     print("Preprocessing completed successfully!")
 
 if __name__ == "__main__":
