@@ -81,3 +81,26 @@ flowchart TD
     Attn --> T_Dec[Time Decoder] --> Output_T[Restored Time Line]
     Attn --> S_Dec[Spec Decoder] --> Output_S[Restored Spectrogram]
 ```
+
+---
+
+## The encoder gets a second job
+
+The diffusion branch added on top of this project **reuses `Encoder1D`** - the same
+Conv1D time encoder drawn above - instead of introducing a second architecture:
+
+```
+x_t [12 x 4800]  ->  Encoder1D  ->  z_t [50 x 136]
+                                      + TimeEmbedding(t) [50]
+                                      -> NoiseDecoder1D -> predicted noise [12 x 4800]
+```
+
+Two things to be clear about:
+
+* It is a **separate instance with its own weights**. The TSR-Net checkpoints in
+  `ckpt/` and the behaviour of `train.py` / `test.py` do not change at all.
+* The head is `Decoder1D` **without the final `Tanh`**. TSR-Net restores a signal
+  scaled to [-1, 1], so squashing the output makes sense there. Predicted noise is an
+  unbounded Gaussian, so a `Tanh` would cap what the head can express.
+
+Full details: [07_diffusion_noise_branch.md](07_diffusion_noise_branch.md).
