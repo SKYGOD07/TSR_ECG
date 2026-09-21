@@ -1,100 +1,199 @@
+"""M1 vs M2 -- the TSR baseline against the diffusion noise score alone.
+
+Computes both anomaly scores for the SAME test records, under the same split
+and the same evaluation protocol, and writes them aligned sample-by-sample to
+``results/scores.csv``.  ``exp05_fusion.py`` reads that file instead of
+recomputing, so the fused numbers are guaranteed to come from these exact
+scores.
+
+    M1  TSR-Net restoration error            (existing baseline, test.py logic)
+    M2  diffusion noise mismatch at t        (normal-only trained predictor)
+
+``--spec`` must match how the TSR checkpoint was trained.  The notebook trains
+the Stage 0 baseline with ``--spec True``, so pass ``--spec 1`` here to score it.
+
+    python experiments/exp04_tsr_vs_noise.py --spec 1 --t 50
+"""
+
+import argparse
 import os
-import sys
-import copy
-import torch
+
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
-from tqdm import tqdm
+import torch
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from dataloader import TestSet
-from lib.TSRNet_time import TSRNet_time
-from diffusion.schedule import DiffusionSchedule
-from models.diffusion_model import DiffusionNoisePredictor
-from evaluation.anomaly_scores import compute_noise_anomaly_score
+from _common import (
+    DEFAULT_DIFFUSION_CKPT,
+    REPO_ROOT,
+    build_diffusion,
+    get_device,
+    load_diffusion_checkpoint,
+    require_data,
+    set_seed,
+)
 
-def min_max_normalize(scores):
-    s_min = scores.min()
-    s_max = scores.max()
-    if s_max == s_min:
-        return np.zeros_like(scores)
-    return (scores - s_min) / (s_max - s_min)
+from dataloader import DiffusionECGSet, TestSet
+from evaluation.anomaly_scores import load_tsr_model, noise_anomaly_scores, tsr_anomaly_scores
+from evaluation.metrics import summarize
+from evaluation.step_analysis import load_test_classes
 
-def main():
-    device = "cuda:0" if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
-    
-    # 1. Dataset
-    data_path = 'data'
-    test_loader = torch.utils.data.DataLoader(
-        TestSet(folder=data_path, fs=500, nperseg=125),
-        batch_size=1, shuffle=False
+
+def pick_timestep(args) -> int:
+    """Use --t when given, else the best MEASURED t from the Stage 4 summary.
+
+    Falls back to the midpoint of the schedule only if neither exists, and says
+    so -- an unmeasured default is never presented as an optimum.
+    """
+    if args.t is not None:
+        print(f"timestep: t={args.t} (given on the command line)")
+        return args.t
+
+    summary_csv = os.path.join(args.results_dir, "step_analysis_summary.csv")
+    if os.path.exists(summary_csv):
+        summary = pd.read_csv(summary_csv).dropna(subset=["roc_auc"])
+        if not summary.empty:
+            row = summary.loc[summary["roc_auc"].idxmax()]
+            t = int(row["t"])
+            print(f"timestep: t={t} (best measured ROC-AUC={row['roc_auc']:.4f} "
+                  f"from {summary_csv})")
+            return t
+
+    t = max(1, args.T // 2)
+    print(f"timestep: t={t} (arbitrary midpoint -- no Stage 4 results found at {summary_csv}; "
+          "run exp03_step_analysis.py to choose this empirically)")
+    return t
+
+
+def main(args):
+    set_seed(args.seed)
+    os.chdir(REPO_ROOT)
+    require_data(args.data_path, "test.npy", "label.npy")
+    device = get_device(args.gpu)
+
+    labels = np.load(os.path.join(args.data_path, "label.npy")).astype(int)
+    n_records = len(labels) if args.limit is None else min(args.limit, len(labels))
+    labels = labels[:n_records]
+    classes = load_test_classes(args.data_path)
+    if classes is not None:
+        classes = classes[:n_records]
+
+    print(f"test records: {n_records} "
+          f"(normal={int((labels == 0).sum())}, abnormal={int((labels == 1).sum())})")
+
+    # ---- M1: TSR-Net baseline --------------------------------------------
+    print(f"\n[M1] TSR-Net ({'time+spectrogram' if args.spec else 'time only'})")
+    tsr_set = TestSet(folder=args.data_path, fs=args.fs, nperseg=args.nperseg)
+    if args.limit is not None:
+        tsr_set = torch.utils.data.Subset(tsr_set, range(n_records))
+    tsr_loader = torch.utils.data.DataLoader(tsr_set, batch_size=1, shuffle=False)
+
+    tsr_model = load_tsr_model(args.tsr_ckpt, device, dims=args.dims, spec=args.spec)
+    print(f"loaded {args.tsr_ckpt}")
+    tsr_scores = tsr_anomaly_scores(
+        tsr_model, tsr_loader, device,
+        dims=args.dims, spec=args.spec, mask_loss=args.mask_loss,
+        mask_ratio_time=args.mask_ratio_time, mask_ratio_spec=args.mask_ratio_spec,
+        patch_length_div=args.patch_length_div,
     )
-    labels = np.load(os.path.join(data_path, 'label.npy')).astype(int)
-    
-    # 2. Models
-    tsr_model = TSRNet_time(enc_in=12).to(device)
-    tsr_ckpt = 'ckpt/TSRNet-latest.pt'
-    if os.path.exists(tsr_ckpt):
-        tsr_model.load_state_dict(torch.load(tsr_ckpt, map_location=device)['model_state_dict'])
-    tsr_model.eval()
-    
-    diff_model = DiffusionNoisePredictor(channels=12).to(device)
-    diff_ckpt = 'ckpt/diffusion/DiffusionNet-latest.pt'
-    if os.path.exists(diff_ckpt):
-        diff_model.load_state_dict(torch.load(diff_ckpt, map_location=device)['model_state_dict'])
-    diff_model.eval()
-    schedule = DiffusionSchedule(T=100).to(device)
-    
-    tsr_scores = []
-    noise_scores = []
-    best_t = 50 
-    
-    print("Computing anomaly scores...")
-    with torch.no_grad():
-        for i, (time_ecg, spectrogram_ecg, r_index) in tqdm(enumerate(test_loader), total=len(labels)):
-            time_length = time_ecg.shape[1]
-            time_ecg = time_ecg.float().to(device)
-            mask_time = copy.deepcopy(time_ecg)
-            
-            mask = torch.zeros((1, time_length, 1), dtype=torch.bool).to(device)
-            patch_interval_time = 4800 // 30
-            for j in range(100 // 30):
-                for k in range(30):
-                    cut_idx = 48*j + patch_interval_time*k
-                    mask[:, cut_idx:cut_idx+48] = 1
-            mask_time = torch.mul(mask_time, ~mask)
-            
-            gen_time, time_var = tsr_model(mask_time)
-            time_err = (gen_time - time_ecg) ** 2
-            l_time = torch.mean(torch.exp(-time_var)*time_err)
-            
-            tsr_score = l_time.detach().cpu().item()
-            tsr_scores.append(tsr_score)
-            
-            x0 = time_ecg.transpose(1, 2)
-            t = torch.tensor([best_t - 1], device=device, dtype=torch.long)
-            epsilon = torch.randn_like(x0)
-            
-            x_t, _ = schedule.add_noise(x0, t, noise=epsilon)
-            epsilon_hat = diff_model(x_t, t)
-            
-            n_score = compute_noise_anomaly_score(epsilon, epsilon_hat).item()
-            noise_scores.append(n_score)
-            
-    tsr_scores = np.array(tsr_scores)
-    noise_scores = np.array(noise_scores)
-    
-    tsr_norm = min_max_normalize(tsr_scores)
-    noise_norm = min_max_normalize(noise_scores)
-    
-    auc_tsr = roc_auc_score(labels, tsr_norm)
-    auc_noise = roc_auc_score(labels, noise_norm)
-    
-    print("\n--- Model Comparison ---")
-    print(f"M1 (TSR-Net Only) AUC:       {auc_tsr:.4f}")
-    print(f"M2 (Noise Only, t={best_t}) AUC: {auc_noise:.4f}")
+    del tsr_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-if __name__ == '__main__':
-    main()
+    # ---- M2: diffusion noise score ---------------------------------------
+    t_public = pick_timestep(args)
+    print(f"\n[M2] diffusion noise score at t={t_public}")
+    diff_set = DiffusionECGSet(
+        folder=args.data_path, split="test", normalize=args.normalize_eval, limit=n_records
+    )
+    diff_loader = torch.utils.data.DataLoader(
+        diff_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
+    )
+    diff_model, forward = build_diffusion(device, T=args.T, dims=args.dims)
+    load_diffusion_checkpoint(diff_model, args.ckpt, device, required=True)
+
+    noise_scores, indices = noise_anomaly_scores(
+        diff_model, forward, diff_loader, device,
+        t_public=t_public, repeats=args.repeats, seed=args.seed,
+    )
+    order = np.argsort(indices)
+    noise_scores = noise_scores[order]
+
+    assert tsr_scores.shape == noise_scores.shape, (
+        f"score vectors must align: TSR {tsr_scores.shape} vs noise {noise_scores.shape}"
+    )
+
+    # ---- report and persist ----------------------------------------------
+    m1 = summarize(labels, tsr_scores)
+    m2 = summarize(labels, noise_scores)
+
+    print("\n--- M1 vs M2 (same test set, same records) ---")
+    header = f"{'model':<34}{'ROC-AUC':>10}{'PR-AUC':>10}{'mean(norm)':>14}{'mean(abn)':>14}"
+    print(header)
+    print("-" * len(header))
+    print(f"{'M1  TSR-Net only':<34}{m1['roc_auc']:>10.4f}{m1['pr_auc']:>10.4f}"
+          f"{m1['mean_normal']:>14.6f}{m1['mean_abnormal']:>14.6f}")
+    print(f"{f'M2  Noise only (t={t_public})':<34}{m2['roc_auc']:>10.4f}{m2['pr_auc']:>10.4f}"
+          f"{m2['mean_normal']:>14.6f}{m2['mean_abnormal']:>14.6f}")
+
+    frame = pd.DataFrame({
+        "sample_id": np.arange(n_records),
+        "label": labels,
+        "tsr_score": tsr_scores,
+        "noise_score": noise_scores,
+    })
+    if classes is not None:
+        frame["class"] = classes
+    frame.attrs["t"] = t_public
+
+    os.makedirs(args.results_dir, exist_ok=True)
+    out_csv = os.path.join(args.results_dir, "scores.csv")
+    frame.to_csv(out_csv, index=False)
+
+    meta = {
+        "t": t_public, "repeats": args.repeats, "seed": args.seed,
+        "spec": args.spec, "mask_loss": args.mask_loss,
+        "normalize_eval": args.normalize_eval,
+        "tsr_ckpt": args.tsr_ckpt, "diffusion_ckpt": args.ckpt,
+        "n_records": n_records, "T": args.T,
+    }
+    meta_path = os.path.join(args.results_dir, "scores_meta.json")
+    with open(meta_path, "w") as fh:
+        import json
+        json.dump(meta, fh, indent=2)
+
+    print(f"\nwrote {out_csv} and {meta_path}")
+    print("Next: python experiments/exp05_fusion.py")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="M1 (TSR) vs M2 (diffusion noise)")
+    parser.add_argument("--data_path", type=str, default="data")
+    parser.add_argument("--tsr_ckpt", type=str, default="ckpt/TSRNet-latest.pt")
+    parser.add_argument("--ckpt", type=str, default=DEFAULT_DIFFUSION_CKPT)
+    parser.add_argument("--spec", type=int, default=1,
+                        help="1 if the TSR checkpoint was trained with --spec True")
+    parser.add_argument("--mask_loss", type=int, default=1,
+                        help="peak-based error, matching the notebook baseline")
+    parser.add_argument("--dims", type=int, default=12)
+    parser.add_argument("--T", type=int, default=100)
+    parser.add_argument("--t", type=int, default=None,
+                        help="public timestep; default = best measured t from exp03")
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=668)
+    parser.add_argument("--gpu", type=str, default="0")
+    parser.add_argument("--results_dir", type=str, default="results")
+    parser.add_argument("--normalize_eval", type=int, default=1)
+    parser.add_argument("--fs", type=int, default=500)
+    parser.add_argument("--nperseg", type=int, default=125)
+    parser.add_argument("--mask_ratio_time", type=int, default=30)
+    parser.add_argument("--mask_ratio_spec", type=int, default=20)
+    parser.add_argument("--patch_length_div", type=int, default=100)
+    args = parser.parse_args()
+    args.spec = bool(args.spec)
+    args.mask_loss = bool(args.mask_loss)
+    args.normalize_eval = bool(args.normalize_eval)
+    main(args)
