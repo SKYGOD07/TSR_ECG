@@ -60,6 +60,35 @@ To evaluate a compiled checkpoint model on the test dataset:
 python test.py --data_path data/ --dims 12 --spec True --load_model 1 --load_path ckpt/TSRNet-latest.pt
 ```
 
+### 4. Diffusion Noise Predictor (New Experimental Branch)
+A new diffusion-based noise prediction branch has been added as a research experiment. This branch uses the existing TSRNet 1D CNN encoder to predict the added noise at various timesteps of a forward diffusion process.
+
+To test the forward diffusion noise addition:
+```powershell
+python experiments/exp01_forward_noise.py
+```
+
+To run a smoke test of the noise predictor architecture:
+```powershell
+python experiments/exp02_noise_prediction.py
+```
+
+To train the noise predictor on normal ECGs:
+```powershell
+python training/train_diffusion.py --epochs 50 --batch_size 32
+```
+
+To evaluate noise anomaly scores across timesteps:
+```powershell
+python experiments/exp03_step_analysis.py
+```
+
+To establish baselines and fuse the original TSRNet anomaly scores with the new diffusion anomaly scores:
+```powershell
+python experiments/exp04_tsr_vs_noise.py
+python experiments/exp05_fusion.py
+```
+
 ---
 
 ## ⚡ Cloud / Kaggle Notebooks
