@@ -89,7 +89,7 @@ real record (`experiments/exp01_forward_noise.py`):
 | 75 | 0.7527 | 0.6584 | 0.343 |
 | 100 | 0.6030 | 0.7978 | 0.245 |
 
-`Images/forward_diffusion_smoke_test.png` shows the same thing visually: the QRS
+`Images/forward_diffusion_smoke_test_normal.png` shows the same thing visually: the QRS
 complexes are clear through `t ≈ 10`, blur around `t ≈ 25–50`, and are buried by
 `t ≈ 75–100`.
 
