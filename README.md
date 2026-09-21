@@ -16,7 +16,7 @@
     <a href="https://www.nganle.net/"><strong>Ngan Le</strong></a>
   </p>
 
-  <h4 align="center"><a href="https://arxiv.org/abs/2312.10187">arXiv Paper</a> | <a href="docs/">Beginner-Friendly Project Guide</a> | <a href="docs/LOCAL_RUN_REPORT.md">Local Execution Report</a> | <a href="docs/output_result.md">Benchmark Report</a></h4>
+  <h4 align="center"><a href="https://arxiv.org/abs/2312.10187">arXiv Paper</a> | <a href="docs/">Beginner-Friendly Project Guide</a> | <a href="docs/07_diffusion_noise_branch.md">Diffusion / Noise Branch</a> | <a href="docs/LOCAL_RUN_REPORT.md">Local Execution Report</a> | <a href="docs/output_result.md">Benchmark Report</a></h4>
   <div align="center"></div>
 
 </p>
@@ -46,7 +46,10 @@ To process raw PhysioNet PTB-XL dataset WFDB files (`.dat` / `.hea`) directly:
 ```powershell
 python preprocess.py --raw_path "path/to/PTBXL_folder" --out_path "data"
 ```
-This generates `data/train.npy` (14,241 samples), `data/test.npy` (2,155 samples), and `data/label.npy`.
+This generates `data/train.npy` (normal-only), `data/test.npy` (2,155 samples),
+`data/label.npy` (binary 0/1) and `data/test_class.npy` (the PTB-XL diagnostic
+superclass per test record, added for the diffusion branch's timestep analysis - the
+first three files are unchanged).
 
 ### 2. Local Training (`train.py`)
 To train the model locally:
@@ -60,41 +63,120 @@ To evaluate a compiled checkpoint model on the test dataset:
 python test.py --data_path data/ --dims 12 --spec True --load_model 1 --load_path ckpt/TSRNet-latest.pt
 ```
 
-### 4. Diffusion Noise Predictor (New Experimental Branch)
-A new diffusion-based noise prediction branch has been added as a research experiment. This branch uses the existing TSRNet 1D CNN encoder to predict the added noise at various timesteps of a forward diffusion process.
+### 4. Diffusion / Noise Branch (research extension)
 
-To test the forward diffusion noise addition:
-```powershell
-python experiments/exp01_forward_noise.py
+A DDPM diffusion branch has been added **alongside** the TSR-Net baseline. It does not
+replace it: `train.py`, `test.py`, `preprocess.py` and everything in `lib/` behave
+exactly as before.
+
+Where TSR-Net masks part of the ECG and measures how badly it restores it, the
+diffusion branch corrupts the ECG with a *known* amount of Gaussian noise and asks the
+network to name the noise it added:
+
+```
+x_t     = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon,   epsilon ~ N(0, I)
+eps_hat = g( TSR_encoder(x_t), TimeEmbedding(t) )
+A_noise = mean( (epsilon - eps_hat)^2 )
+A_final = alpha * A_TSR + (1 - alpha) * A_noise
 ```
 
-To run a smoke test of the noise predictor architecture:
+The predictor **reuses TSR-Net's `Encoder1D`** rather than introducing a second
+architecture (a separate instance with its own weights - the TSR checkpoints are
+untouched), and is trained on **normal ECGs only**, so an abnormal record produces a
+larger prior/posterior noise mismatch.
+
+> **The HeartPy filtering in `preprocess.py` is not the diffusion noise.** That is
+> preprocessing - *removing* baseline wander and mains hum. Diffusion noise is
+> *injected* afterwards, deliberately, as the training target. Diffusion begins after
+> the preprocessed arrays exist and never modifies them.
+
+Full write-up, including the maths, the exact tensor shapes and the known limitations:
+**[docs/07_diffusion_noise_branch.md](docs/07_diffusion_noise_branch.md)**.
+
+Run the stages **in order** - each one is a gate for the next:
+
 ```powershell
-python experiments/exp02_noise_prediction.py
+# Stage 1 - forward diffusion only, nothing is trained
+python experiments/exp01_forward_noise.py --split train --index 0 --tag normal
+python experiments/exp01_forward_noise.py --split test --index 1 --normalize 1 --tag abnormal
+
+# Stage 2 - smoke test FIRST, then train on normal ECGs only
+python experiments/exp02_noise_prediction.py --batch_size 8 --steps 3
+python training/train_diffusion.py --epochs 10 --batch_size 32 --T 100 --seed 668
+
+# Stage 3 + 4 - noise anomaly score, and which timesteps are informative
+python experiments/exp03_step_analysis.py --repeats 3 --seed 668
+
+# Stage 5 - fuse the TSR score with the noise score
+python experiments/exp04_tsr_vs_noise.py --spec 1 --mask_loss 1 --repeats 3 --seed 668
+python experiments/exp05_fusion.py --alpha 0.5
 ```
 
-To train the noise predictor on normal ECGs:
-```powershell
-python training/train_diffusion.py --epochs 50 --batch_size 32
-```
+`--spec 1` must match how the TSR checkpoint was trained (`train.py --spec True`);
+a mismatch raises a clear error rather than producing meaningless scores.
 
-To evaluate noise anomaly scores across timesteps:
-```powershell
-python experiments/exp03_step_analysis.py
-```
+Diffusion checkpoints go to `ckpt/diffusion/`, kept separate from the TSR-Net
+checkpoints in `ckpt/`. Result tables go to `results/`, figures to `Images/`.
 
-To establish baselines and fuse the original TSRNet anomaly scores with the new diffusion anomaly scores:
-```powershell
-python experiments/exp04_tsr_vs_noise.py
-python experiments/exp05_fusion.py
-```
+#### Ablation
+
+| | TSR | Diffusion | Noise score | Adaptive steps | Status |
+|---|---|---|---|---|---|
+| **M1** | yes | - | - | - | implemented |
+| **M2** | - | yes | yes | - | implemented |
+| **M4** | yes | yes | yes | - | implemented |
+| **M5** | yes | yes | yes | global `t*` | implemented |
+| **M6** | yes | yes | yes | anomaly-specific | not implemented |
+| **M7** | yes | yes | yes | learnable | not implemented |
+
+M6/M7 are deliberately left for later. Building a learned timestep selector before the
+fixed-`t` numbers are in hand would make any gain impossible to attribute.
+
+#### Scientific ground rules baked into the code
+
+- No AUC is hard-coded, and no improvement is claimed that was not measured - if
+  fusion fails to beat the better single branch, the script prints exactly that.
+- No timestep is called optimal until it has been evaluated; `best_timestep()` reports
+  the argmax over the grid that actually ran, and labels it as such.
+- The alpha sweep is tuned on the test set, so it is reported as an upper bound; the
+  fixed alpha = 0.5 result is the headline.
+- PTB-XL superclasses (`NORM/MI/STTC/CD/HYP`) come from `data/test_class.npy`, saved
+  additively by `preprocess.py`. **AF and PVC labels do not exist in this pipeline and
+  are never fabricated.**
+
+#### Known limitation: train/test amplitude gap
+
+`preprocess.denoise_train` normalises each lead to [-1, 1]; `preprocess.denoise_test`
+does not (train std ~0.56, test std ~0.20). Diffusion SNR depends directly on the
+amplitude of `x_0`, so this is corrected **at evaluation time, not on disk** -
+`--normalize_eval 1` (the default) re-applies the same per-lead min-max to test
+windows. The preprocessing outputs and the TSR-Net path are untouched. See
+[docs/07_diffusion_noise_branch.md](docs/07_diffusion_noise_branch.md) section 11.
 
 ---
 
 ## ⚡ Cloud / Kaggle Notebooks
 
-- **[TSRNet_Kaggle_Drive_Download.ipynb](TSRNet_Kaggle_Drive_Download.ipynb):** Notebook equipped with high-speed 16-connection parallel `aria2c` PhysioNet dataset downloading for automated 50-epoch GPU training on Kaggle.
-- **[TSRNet_Kaggle_Demo.ipynb](TSRNet_Kaggle_Demo.ipynb):** Notebook pre-configured for Kaggle Input Datasets.
+- **[TSRNet_Kaggle_Merge_Demo.ipynb](TSRNet_Kaggle_Merge_Demo.ipynb):** the main notebook. Auto-merges split PTB-XL uploads, then runs the full pipeline in labelled sections:
+
+  | Section | Stage | What it does |
+  |---|---|---|
+  | A | - | Internet, GPU check (refuses to fall back to CPU), dependencies, repo |
+  | B | - | Merge PTB-XL, preprocess (cached), verify the `.npy` files **and** the diffusion modules |
+  | C | **0** | Existing TSR-Net baseline - train, test, record the baseline AUC |
+  | D | **1** | DDPM forward diffusion (nothing trained) |
+  | E | **1 test** | Noise visualisation at t = 1, 10, 25, 50, 75, 100 - normal vs abnormal |
+  | F | **2** | Noise predictor + smoke test (the gate before training) |
+  | G | **2 train** | Normal-ECG-only training (cached) + loss curve |
+  | H | **3** | Noise anomaly score |
+  | I | **4** | Timestep analysis |
+  | J | **5** | TSR + noise fusion, M1/M2/M4 ablation |
+
+  Run it **section by section** on the first pass, not Run All. Sections A-C must
+  complete and the Stage 0 AUC must be recorded before Section D.
+
+- **[TSRNet_Kaggle_Drive_Download.ipynb](TSRNet_Kaggle_Drive_Download.ipynb):** Notebook equipped with high-speed 16-connection parallel `aria2c` PhysioNet dataset downloading for automated 50-epoch GPU training on Kaggle. (Stage 0 baseline only.)
+- **[TSRNet_Kaggle_Demo.ipynb](TSRNet_Kaggle_Demo.ipynb):** Notebook pre-configured for Kaggle Input Datasets. (Stage 0 baseline only.)
 
 ---
 
@@ -105,7 +187,9 @@ python experiments/exp05_fusion.py
   <li>Numpy</li>
   <li>SciPy</li>
   <li>wfdb</li>
+  <li>heartpy</li>
   <li>scikit-learn</li>
+  <li>pandas, matplotlib, tqdm (diffusion experiments and result tables)</li>
 </ul>
 
 ## Datasets
