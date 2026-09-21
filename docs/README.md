@@ -21,3 +21,17 @@ Welcome! This folder contains a step-by-step, plain-English breakdown of the ent
 
 6. **[Evaluation and the ROC-AUC Score](06_evaluation_and_scores.md)**  
    *How we grade the AI's final exam and what the scores mean.*
+
+7. **[The Diffusion / Noise Branch](07_diffusion_noise_branch.md)**  
+   *The new research extension: adding controlled noise on purpose, asking the network
+   to name it, and using the mismatch as a second anomaly score. Covers Stages 0-5,
+   the exact maths, how to run it, and the known limitations.*
+
+---
+
+## Reports
+
+- **[LOCAL_RUN_REPORT.md](LOCAL_RUN_REPORT.md)** - local execution metrics
+- **[ANALYSIS_REPORT.md](ANALYSIS_REPORT.md)** - analysis notes
+- **[output_result.md](output_result.md)** - benchmark output
+- **[testing.md](testing.md)** - testing notes
