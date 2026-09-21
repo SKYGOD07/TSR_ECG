@@ -7,3 +7,6 @@ __pycache__/
 Testing dataset/
 "Testing dataset/"
 ../../Testing dataset/
+
+# Diffusion experiment outputs (CSV tables written by experiments/exp0*.py)
+results/
