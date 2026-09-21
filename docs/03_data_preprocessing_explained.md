@@ -77,3 +77,51 @@ After `preprocess.py` finishes reading the `ptbxl_database.csv`, filtering the n
 * **`data/label.npy`**: A list of the correct answers for the test patients (0 for Healthy, 1 for Sick) so we can grade the AI's final exam.
 
 Because these are saved as binary `.npy` files instead of text, PyTorch can load them into memory in fractions of a second when training begins!
+
+---
+
+## Part 5: Two things that were added later
+
+### `data/test_class.npy`
+
+Alongside `label.npy` (0 = healthy, 1 = sick), `preprocess.py` now also saves the raw
+PTB-XL **diagnostic superclass** for each test patient:
+
+| Code | Meaning |
+|---|---|
+| `NORM` | normal |
+| `MI` | myocardial infarction |
+| `STTC` | ST/T-wave changes |
+| `CD` | conduction disturbance |
+| `HYP` | hypertrophy |
+
+This is purely additive - `train.npy`, `test.npy` and `label.npy` are exactly what they
+always were. It exists so the diffusion branch can ask whether *different kinds* of
+abnormality are easiest to spot at different noise levels. Without it, that question
+cannot be answered honestly, and the right response is to say so rather than invent
+class labels.
+
+### A wrinkle worth knowing: train and test are not scaled the same way
+
+Look carefully at `preprocess.py`:
+
+* `denoise_train` runs `normalize(hp_preprocess(...))` - filtering **and** min-max scaling.
+* `denoise_test` runs `hp_preprocess(...)` alone - filtering **only**.
+
+So `train.npy` lives neatly in [-1, 1] (std ~0.56), while `test.npy` keeps its original
+millivolt amplitudes (std ~0.20, with outliers past +/-5). This comes from the original
+repository and TSR-Net has always been evaluated this way.
+
+It matters much more for the diffusion branch, because diffusion mixes the signal with
+fixed-size noise - so the *ratio* between them depends directly on how big the signal
+is. The diffusion code therefore re-applies the same min-max scaling to test windows
+**at evaluation time**, leaving the files on disk untouched. See
+[07_diffusion_noise_branch.md](07_diffusion_noise_branch.md) section 11.
+
+### One more time: filtering is not diffusion noise
+
+Everything on this page is about **removing** unwanted noise before the AI ever sees
+the signal. The diffusion branch **adds** noise on purpose, afterwards, and asks the
+network to identify it. They are opposite operations at opposite ends of the pipeline
+and should never be confused. See
+[07_diffusion_noise_branch.md](07_diffusion_noise_branch.md) section 2.
